@@ -1,0 +1,228 @@
+#gromacs execution for glc-09 as example
+#gromacs binary as gmx_mkl
+#one core for each temperature, 48 simulations at same time
+
+
+#some useful variables
+nrtemp=$(cat temperature.list | awk '{print NF-1}')
+origin=$pwd
+
+#1. minimization energy of solute and solvent configuration before main simulation
+cd $origin/base
+gmx_mkl editconf -f solute.gro -o newbox.gro -c -princ -box 8 4 4 
+gmx_mkl solvate -cp newbox.gro -cs acn256.gro -p topol.top -o solv.gro 
+gmx_mkl grompp -f em.mdp -c solv.gro -p topol.top -o em.tpr -v
+gmx_mkl mdrun -ntomp 2 -v -deffnm em 
+cd $origin
+
+
+
+#2. start replica exchange molecular dynamics calculation REMD
+
+#2.1 Prepare equilibrium REMD
+input=em.gro
+for i in $(seq 0 1 $nrtemp)
+do
+    j=$(( i + 1 )) 
+    temperature=$(awk -v x=$j '{print $x}' temperature.list)
+    mkdir equil$i
+    cp base/acn.itp base/equil.mdp base/$input base/topol.top equil$i
+    cd equil$i
+    sed -i "s/CHANGE_TEMPERATURE/$temperature/" equil.mdp
+    gmx_mkl grompp -c $input -f equil.mdp -p topol.top -o equil.tpr 
+    cd ..
+
+done
+
+#2.2 executing equilibrium REMD
+mpirun -genvnone -np 48  `which gmx_mkl` mdrun -v -multidir equil{0..47} -ntomp 1 -s equil.tpr -g md-equil.log  
+
+
+#2.3 Prepare production REMD
+for i in $(seq 0 1 $nrtemp)
+do
+    j=$(( i + 1 )) 
+    temperature=$(awk -v x=$j '{print $x}' temperature.list)
+
+    mkdir sim$i
+    cp base/acn.itp base/sim.mdp base/topol.top sim$i
+    cd sim$i
+    sed -i "s/CHANGE_TEMPERATURE/$temperature/" sim.mdp
+
+    gmx_mkl grompp -c ../equil$i/confout.gro -t ../equil$i/state.cpt  -f sim.mdp -p topol.top -o sim.tpr  > grompp-sim.log 2>&1
+
+    cd ..
+done
+
+
+#2.4 executing production REMD
+
+mpirun -genvnone -np 48  `which gmx_mkl` mdrun -ntomp 1 -v -multidir sim{0..47} -s sim.tpr -replex 100 -g md-sim.log > mdrun-sim.log 2>&1
+
+
+
+#3. Select conformations using Cluster method
+
+
+#3.1 De-multiplexing an REMD trajectory in GROMAC
+cd $origin/
+demux.pl sim0/md-sim.log
+gmx_mkl trjcat -f sim{0..47}/traj_comp.xtc -demux replica_index.xvg 
+
+
+#3.2 select only 3 first temperatures - after some text, provide several conformations with lower energy
+mkdir configurations
+gmx_mkl trjcat -f {0..2}_trajout.xtc -o conformations_from_demux.xtc  -settime -cat yes -overwrite no -sort yes 
+gmx_mkl cluster -f conformations_from_demux.xtc -s sim0/sim.tpr -n backbone.ndx -cl conformations/conformations_from_demux.xtc.pdb -method gromos -cutoff 0.35 -om conformations/conformations_from_demux.xtc.rmsd-raw.xpm -g conformations/conformations_from_demux.xtc.log -dist conformations/conformations_from_demux.xtc.rmsd-dist.xvg 
+
+
+#3.3 Minimize the energy for all conformations and calculate the energy with xTB
+cd $origin/conformations
+mkdir em-newbox-free-whole-molecule
+cp ../sim0/topol.top* em-newbox-free-whole-molecule
+cp ../sim0/acn256.gro em-newbox-free-whole-molecule
+cp ../sim0/acn.itp    em-newbox-free-whole-molecule
+
+cd em-newbox-free-whole-molecule
+ 
+echo "integrator               = steep
+nsteps                   = 100000
+emtol                    = 0.01
+emstep                   = 0.01
+nstxout                  = 0
+nstenergy                = 0" > em.mdp
+
+#obtain the unique files for each conformation 
+gmx_mkl trjconv -split 1 -f ../conformations_from_demux.xtc --sep yes -o split.gro -nzero 3 -s ../../sim0/sim.tpr <<EOF
+0
+EOF
+
+nfiles=$(\ls -1 split???.gro | wc -l | awk '{print $1-1}')
+for i in $(seq -w 000 $nfiles); do 
+
+	gmx_mkl grompp -f em.mdp -c split$i.gro -p topol.top -o opt$i.tpr
+
+	gmx_mkl mdrun -deffnm opt$i 
+	
+	gmx_mkl trjconv -f opt$i.gro -o solute-opt$i.gro -s opt$i.tpr -ur compact -pbc nojump -center yes
+
+	obabel -i gro solute-opt$i.gro -o xyz -O solute-opt$i.xyz 
+
+    #energy of solute using xTB 
+	xtb solute-opt$i.xyz --alpb Acetonitrile  > xtb-only-solule-opt$i.output 2>&1
+done
+
+
+
+#4. calculate NPSA and other properties using turbomole and CS-NPSA script
+
+for i in solute-opt???.xyz ; do
+	j=${i/.xyz/}
+	echo $i $j
+    cd $origin
+
+	mkdir $j
+	x2t $i > $j/coord
+	cd $j
+    #4.1 prepera the input for tubomole
+	define >define.out 2>&1 <<EOF
+
+        
+        
+a coord
+*
+no
+b all SV
+bl
+
+*
+eht
+
+
+
+scf
+iter
+300
+
+
+ri
+on
+m
+1200
+jbas
+bl
+*
+
+dft
+func pbe
+on
+
+
+marij
+
+*
+*
+*
+EOF
+
+	#4.2 include solvent in input
+	cosmoprep >cosmo.out 2>&1 <<EOF
+37.5
+1.443
+
+
+
+
+
+
+
+
+
+r all o
+*
+out.cosmo
+
+
+
+
+EOF
+
+	#4.3 executing ridft with turbomole
+	echo "executing ridft"
+	ridft > ridft.out
+
+
+	#4.4 execute python cs-npsa-code
+	python $NPSAfolder/NPSA.py <<EOF
+Turbomole
+out.cosmo
+0.01
+EOF
+    #4.5 locate the important values in the output
+	npsa=$(grep "The value of NPSA with threshold" npsa.txt | tail -n1 | awk '{print $10}')
+	volume=$(grep "volume (bohr"   ridft.out | awk '{print $3}')
+	area=$(grep "area (bohr"  ridft.out | awk '{print $3}')
+	dft=$(grep "Total energy + OC corr. =" ridft.out | awk '{print $7}')
+
+    cd $origin
+done
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
